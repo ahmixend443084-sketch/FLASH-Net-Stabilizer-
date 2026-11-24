@@ -24,6 +24,8 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.util.Locale
+import kotlin.math.abs
 
 class FloatingPanelService : Service() {
 
@@ -34,13 +36,13 @@ class FloatingPanelService : Service() {
 
     private var bubble: TextView? = null
     private var panel: ScrollView? = null
+
     private var monitoring = false
     private var expanded = false
     private var destroyed = false
 
     private var connectionText: TextView? = null
     private var latencyText: TextView? = null
-    private var averageText: TextView? = null
     private var jitterText: TextView? = null
     private var failureText: TextView? = null
     private var statusText: TextView? = null
@@ -69,7 +71,6 @@ class FloatingPanelService : Service() {
             getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
         monitor = NetworkMonitor(this)
-
         startFlashForeground()
     }
 
@@ -100,21 +101,21 @@ class FloatingPanelService : Service() {
                 NotificationManager.IMPORTANCE_LOW
             )
 
-            val manager =
-                getSystemService(NotificationManager::class.java)
-
-            manager.createNotificationChannel(channel)
+            getSystemService(NotificationManager::class.java)
+                .createNotificationChannel(channel)
         }
 
-        val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
         }
+
+        val notification = builder
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentTitle("FLASH Net Stabilizer")
-            .setContentText("Floating network monitor is running")
+            .setContentText("Network monitoring service")
             .setOngoing(true)
             .build()
 
@@ -130,43 +131,44 @@ class FloatingPanelService : Service() {
         }
     }
 
-    private fun createBackground(color: Int, radius: Float): GradientDrawable {
-        return GradientDrawable().apply {
-            setColor(color)
-            cornerRadius = radius
-        }
+    private fun background(
+        color: Int,
+        radius: Float
+    ) = GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = radius
     }
 
     private fun makeText(
-        text: String,
+        value: String,
         size: Float,
         color: Int = Color.WHITE
-    ): TextView {
-        return TextView(this).apply {
-            this.text = text
-            textSize = size
-            setTextColor(color)
-            setPadding(12, 8, 12, 8)
-        }
+    ) = TextView(this).apply {
+        text = value
+        textSize = size
+        setTextColor(color)
+        setPadding(8, 4, 8, 4)
     }
 
     private fun makeButton(
-        text: String,
+        value: String,
         action: () -> Unit
-    ): Button {
-        return Button(this).apply {
-            this.text = text
-            isAllCaps = false
-            setOnClickListener { action() }
-        }
+    ) = Button(this).apply {
+        text = value
+        textSize = 12f
+        isAllCaps = false
+        minHeight = 38
+        minimumHeight = 38
+        setPadding(8, 0, 8, 0)
+        setOnClickListener { action() }
     }
 
-    private fun layoutParams(
+    private fun createParams(
         width: Int,
         height: Int,
         gravity: Int
     ): WindowManager.LayoutParams {
-        val windowType =
+        val type =
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
             } else {
@@ -177,7 +179,7 @@ class FloatingPanelService : Service() {
         return WindowManager.LayoutParams(
             width,
             height,
-            windowType,
+            type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
@@ -191,19 +193,19 @@ class FloatingPanelService : Service() {
 
         val view = TextView(this).apply {
             text = "⚡"
-            textSize = 25f
+            textSize = 24f
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
-            background = createBackground(
-                Color.rgb(20, 145, 255),
-                60f
+            background = background(
+                Color.rgb(15, 135, 245),
+                50f
             )
-            elevation = 12f
+            elevation = 8f
         }
 
-        val params = layoutParams(
-            58,
-            58,
+        val params = createParams(
+            48,
+            48,
             Gravity.TOP or Gravity.START
         ).apply {
             x = 0
@@ -211,35 +213,36 @@ class FloatingPanelService : Service() {
         }
 
         view.setOnTouchListener(object : View.OnTouchListener {
-            private var startX = 0
-            private var startY = 0
-            private var touchX = 0f
-            private var touchY = 0f
+            private var downX = 0f
+            private var downY = 0f
+            private var initialX = 0
+            private var initialY = 0
             private var moved = false
 
-            override fun onTouch(v: View, event: MotionEvent): Boolean {
+            override fun onTouch(
+                v: View,
+                event: MotionEvent
+            ): Boolean {
                 when (event.action) {
                     MotionEvent.ACTION_DOWN -> {
-                        startX = params.x
-                        startY = params.y
-                        touchX = event.rawX
-                        touchY = event.rawY
+                        downX = event.rawX
+                        downY = event.rawY
+                        initialX = params.x
+                        initialY = params.y
                         moved = false
                         return true
                     }
 
                     MotionEvent.ACTION_MOVE -> {
-                        val dx = (event.rawX - touchX).toInt()
-                        val dy = (event.rawY - touchY).toInt()
+                        val dx = (event.rawX - downX).toInt()
+                        val dy = (event.rawY - downY).toInt()
 
-                        if (kotlin.math.abs(dx) > 8 ||
-                            kotlin.math.abs(dy) > 8
-                        ) {
+                        if (abs(dx) > 7 || abs(dy) > 7) {
                             moved = true
                         }
 
-                        params.x = (startX + dx).coerceAtLeast(0)
-                        params.y = (startY + dy).coerceAtLeast(0)
+                        params.x = (initialX + dx).coerceAtLeast(0)
+                        params.y = (initialY + dy).coerceAtLeast(0)
 
                         try {
                             windowManager.updateViewLayout(view, params)
@@ -249,9 +252,7 @@ class FloatingPanelService : Service() {
                     }
 
                     MotionEvent.ACTION_UP -> {
-                        if (!moved) {
-                            openPanel()
-                        }
+                        if (!moved) openPanel()
                         return true
                     }
                 }
@@ -269,7 +270,6 @@ class FloatingPanelService : Service() {
 
     private fun openPanel() {
         if (destroyed || expanded) return
-
         removeBubble()
         showPanel()
     }
@@ -280,40 +280,31 @@ class FloatingPanelService : Service() {
 
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(14, 12, 14, 12)
-            background = createBackground(
-                Color.rgb(24, 29, 40),
-                22f
+            setPadding(10, 8, 10, 8)
+            background = background(
+                Color.rgb(23, 29, 41),
+                16f
             )
         }
 
-        content.addView(
-            makeText(
-                "FLASH NET STABILIZER",
-                19f
-            ).apply {
-                typeface = Typeface.DEFAULT_BOLD
-            }
-        )
+        val heading = TextView(this).apply {
+            text = "⚡ FLASH NET"
+            textSize = 16f
+            setTextColor(Color.WHITE)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(8, 3, 8, 5)
+        }
 
-        content.addView(
-            makeText(
-                "Network diagnostics",
-                13f,
-                Color.LTGRAY
-            )
-        )
+        content.addView(heading)
 
-        connectionText = makeText("Connection: checking...", 14f)
-        latencyText = makeText("Probe time: --", 14f)
-        averageText = makeText("Average probe time: --", 14f)
-        jitterText = makeText("Jitter estimate: --", 14f)
-        failureText = makeText("Failed probes: --", 14f)
-        statusText = makeText("Monitoring is OFF", 13f, Color.YELLOW)
+        connectionText = makeText("Network: checking...", 12f)
+        latencyText = makeText("Latency: --", 12f)
+        jitterText = makeText("Jitter: --", 12f)
+        failureText = makeText("Failed probes: --", 12f)
+        statusText = makeText("Monitoring OFF", 11f, Color.YELLOW)
 
         content.addView(connectionText)
         content.addView(latencyText)
-        content.addView(averageText)
         content.addView(jitterText)
         content.addView(failureText)
         content.addView(statusText)
@@ -321,7 +312,6 @@ class FloatingPanelService : Service() {
         toggleButton = makeButton("START MONITORING") {
             toggleMonitoring()
         }
-
         content.addView(toggleButton)
 
         content.addView(
@@ -337,21 +327,25 @@ class FloatingPanelService : Service() {
         )
 
         val scroll = ScrollView(this).apply {
+            isFillViewport = true
             addView(content)
-            background = createBackground(
-                Color.rgb(24, 29, 40),
-                22f
+            background = background(
+                Color.rgb(23, 29, 41),
+                16f
             )
         }
 
-        val params = layoutParams(
-            (resources.displayMetrics.widthPixels * 0.88f).toInt(),
+        val screenWidth = resources.displayMetrics.widthPixels
+        val panelWidth = minOf(
+            (screenWidth * 0.76f).toInt(),
+            dp(280)
+        )
+
+        val params = createParams(
+            panelWidth,
             WindowManager.LayoutParams.WRAP_CONTENT,
             Gravity.CENTER
-        ).apply {
-            flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-            width = minOf(width, 360)
-        }
+        )
 
         try {
             windowManager.addView(scroll, params)
@@ -364,16 +358,23 @@ class FloatingPanelService : Service() {
         }
     }
 
+    private fun dp(value: Int): Int {
+        return (value * resources.displayMetrics.density).toInt()
+    }
+
     private fun toggleMonitoring() {
         if (monitoring) {
             monitoring = false
             handler.removeCallbacks(monitorTask)
             toggleButton?.text = "START MONITORING"
-            statusText?.text = "Monitoring is OFF"
+            statusText?.text = "Monitoring OFF"
+            statusText?.setTextColor(Color.YELLOW)
         } else {
             monitoring = true
             toggleButton?.text = "STOP MONITORING"
-            statusText?.text = "Checking network..."
+            statusText?.text = "Checking connection..."
+            statusText?.setTextColor(Color.CYAN)
+
             handler.removeCallbacks(monitorTask)
             handler.post(monitorTask)
         }
@@ -381,29 +382,37 @@ class FloatingPanelService : Service() {
 
     private fun updatePanel(status: NetworkStatus) {
         connectionText?.text =
-            "Connection: ${status.transport} | " +
-            if (status.internetValidated) {
-                "Internet OK"
-            } else {
-                "Internet unverified"
-            }
+            "Network: ${status.transport}" +
+                if (status.internetValidated) " • Online"
+                else " • Unverified"
 
         latencyText?.text =
-            "Latest probe: ${status.latencyMs?.let { "$it ms" } ?: "Failed"}"
-
-        averageText?.text =
-            "Average probe: ${status.averageLatencyMs?.let { "$it ms" } ?: "--"}"
+            "Latency: ${
+                status.latencyMs?.let { "$it ms" } ?: "--"
+            }"
 
         jitterText?.text =
-            "Jitter estimate: ${status.jitterMs?.let {
-                String.format(java.util.Locale.US, "%.1f ms", it)
-            } ?: "--"}"
+            "Jitter: ${
+                status.jitterMs?.let {
+                    String.format(Locale.US, "%.1f ms", it)
+                } ?: "--"
+            }"
 
         failureText?.text =
-            "Failed probes: ${status.failedProbes}/${status.totalProbes} " +
-            "(${String.format(java.util.Locale.US, "%.1f", status.failurePercent)}%)"
+            "Failed: ${status.failedProbes}/${status.totalProbes} " +
+                "(${String.format(Locale.US, "%.0f", status.failurePercent)}%)"
 
         statusText?.text = status.message
+        statusText?.setTextColor(
+            if (status.latencyMs != null &&
+                status.latencyMs < 100 &&
+                status.failurePercent == 0.0
+            ) {
+                Color.GREEN
+            } else {
+                Color.YELLOW
+            }
+        )
     }
 
     private fun hidePanelToBubble() {
@@ -419,7 +428,6 @@ class FloatingPanelService : Service() {
 
         connectionText = null
         latencyText = null
-        averageText = null
         jitterText = null
         failureText = null
         statusText = null
@@ -443,7 +451,9 @@ class FloatingPanelService : Service() {
         monitoring = false
         handler.removeCallbacksAndMessages(null)
 
-        monitor.close()
+        if (::monitor.isInitialized) {
+            monitor.close()
+        }
 
         panel?.let {
             try {
