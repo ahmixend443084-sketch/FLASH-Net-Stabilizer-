@@ -5,8 +5,8 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.Context
 import android.content.Intent
-import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
@@ -28,55 +28,49 @@ import android.widget.TextView
 class FloatingPanelService : Service() {
 
     private lateinit var windowManager: WindowManager
-    private lateinit var mainHandler: Handler
+    private lateinit var monitor: NetworkMonitor
+
+    private val handler = Handler(Looper.getMainLooper())
 
     private var bubble: TextView? = null
-    private var panel: LinearLayout? = null
-    private var statusView: TextView? = null
-    private var connectionView: TextView? = null
-    private var latencyView: TextView? = null
-    private var monitorButton: Button? = null
-
-    private var expanded = false
+    private var panel: ScrollView? = null
     private var monitoring = false
-    private var monitor: NetworkMonitor? = null
+    private var expanded = false
+    private var destroyed = false
 
-    private val green = Color.rgb(0, 255, 145)
-    private val dark = Color.rgb(15, 20, 26)
+    private var connectionText: TextView? = null
+    private var latencyText: TextView? = null
+    private var averageText: TextView? = null
+    private var jitterText: TextView? = null
+    private var failureText: TextView? = null
+    private var statusText: TextView? = null
+    private var toggleButton: Button? = null
 
     private val monitorTask = object : Runnable {
         override fun run() {
-            if (!monitoring) return
+            if (!monitoring || destroyed) return
 
-            monitor?.checkConnection { result ->
-                mainHandler.post {
-                    if (!monitoring) return@post
-
-                    connectionView?.text =
-                        "Connection: ${result.transport}"
-
-                    latencyView?.text =
-                        "Internet check: " +
-                        (if (result.internetValidated) "Available" else "Unconfirmed") +
-                        "\nProbe time: " +
-                        (result.latencyMs?.let { "$it ms" } ?: "Unavailable") +
-                        "\n${result.message}"
+            monitor.checkConnection { status ->
+                handler.post {
+                    if (!destroyed && monitoring) {
+                        updatePanel(status)
+                    }
                 }
             }
 
-            mainHandler.postDelayed(this, 5000)
+            handler.postDelayed(this, 5000)
         }
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
-
     override fun onCreate() {
         super.onCreate()
-        mainHandler = Handler(Looper.getMainLooper())
-        createNotificationChannel()
-        startFlashForeground()
-        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+
+        windowManager =
+            getSystemService(Context.WINDOW_SERVICE) as WindowManager
+
         monitor = NetworkMonitor(this)
+
+        startFlashForeground()
     }
 
     override fun onStartCommand(
@@ -93,30 +87,32 @@ class FloatingPanelService : Service() {
             showBubble()
         }
 
-        return START_NOT_STICKY
-    }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                "flash_net_channel",
-                "FLASH Net Stabilizer",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val manager =
-                getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-            manager.createNotificationChannel(channel)
-        }
+        return START_STICKY
     }
 
     private fun startFlashForeground() {
-        val notification = if (Build.VERSION.SDK_INT >= 26) {
-            Notification.Builder(this, "flash_net_channel")
+        val channelId = "flash_net_monitor"
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "FLASH Network Monitoring",
+                NotificationManager.IMPORTANCE_LOW
+            )
+
+            val manager =
+                getSystemService(NotificationManager::class.java)
+
+            manager.createNotificationChannel(channel)
+        }
+
+        val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, channelId)
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
         }
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentTitle("FLASH Net Stabilizer")
             .setContentText("Floating network monitor is running")
             .setOngoing(true)
@@ -126,254 +122,348 @@ class FloatingPanelService : Service() {
             startForeground(
                 101,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                android.content.pm.ServiceInfo
+                    .FOREGROUND_SERVICE_TYPE_SPECIAL_USE
             )
         } else {
             startForeground(101, notification)
         }
     }
 
-    private fun createParams(): WindowManager.LayoutParams {
-        val type = if (Build.VERSION.SDK_INT >= 26) {
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        } else {
-            WindowManager.LayoutParams.TYPE_PHONE
+    private fun createBackground(color: Int, radius: Float): GradientDrawable {
+        return GradientDrawable().apply {
+            setColor(color)
+            cornerRadius = radius
         }
+    }
+
+    private fun makeText(
+        text: String,
+        size: Float,
+        color: Int = Color.WHITE
+    ): TextView {
+        return TextView(this).apply {
+            this.text = text
+            textSize = size
+            setTextColor(color)
+            setPadding(12, 8, 12, 8)
+        }
+    }
+
+    private fun makeButton(
+        text: String,
+        action: () -> Unit
+    ): Button {
+        return Button(this).apply {
+            this.text = text
+            isAllCaps = false
+            setOnClickListener { action() }
+        }
+    }
+
+    private fun layoutParams(
+        width: Int,
+        height: Int,
+        gravity: Int
+    ): WindowManager.LayoutParams {
+        val windowType =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            } else {
+                @Suppress("DEPRECATION")
+                WindowManager.LayoutParams.TYPE_PHONE
+            }
 
         return WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            type,
+            width,
+            height,
+            windowType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = 0
-            y = 250
+            this.gravity = gravity
         }
-    }
-
-    private fun makeBackground(
-        color: Int,
-        radius: Float
-    ) = GradientDrawable().apply {
-        setColor(color)
-        cornerRadius = radius
-        setStroke(2, green)
     }
 
     private fun showBubble() {
-        if (bubble != null) return
+        if (destroyed || bubble != null || expanded) return
+        if (!Settings.canDrawOverlays(this)) return
 
         val view = TextView(this).apply {
             text = "⚡"
-            textSize = 24f
+            textSize = 25f
             gravity = Gravity.CENTER
-            setTextColor(green)
-            background = makeBackground(dark, 60f)
-            setPadding(18, 12, 18, 12)
-            contentDescription = "Open FLASH controls"
+            setTextColor(Color.WHITE)
+            background = createBackground(
+                Color.rgb(20, 145, 255),
+                60f
+            )
+            elevation = 12f
         }
 
-        val params = createParams()
-        bubble = view
+        val params = layoutParams(
+            58,
+            58,
+            Gravity.TOP or Gravity.START
+        ).apply {
+            x = 0
+            y = 220
+        }
 
-        var downX = 0f
-        var downY = 0f
-        var originalX = 0
-        var originalY = 0
-        var dragged = false
+        view.setOnTouchListener(object : View.OnTouchListener {
+            private var startX = 0
+            private var startY = 0
+            private var touchX = 0f
+            private var touchY = 0f
+            private var moved = false
 
-        view.setOnTouchListener { _, event ->
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    downX = event.rawX
-                    downY = event.rawY
-                    originalX = params.x
-                    originalY = params.y
-                    dragged = false
-                    true
-                }
-
-                MotionEvent.ACTION_MOVE -> {
-                    val dx = (event.rawX - downX).toInt()
-                    val dy = (event.rawY - downY).toInt()
-
-                    if (kotlin.math.abs(dx) > 8 ||
-                        kotlin.math.abs(dy) > 8
-                    ) dragged = true
-
-                    if (dragged) {
-                        params.x = originalX + dx
-                        params.y = originalY + dy
-                        runCatching {
-                            windowManager.updateViewLayout(view, params)
-                        }
+            override fun onTouch(v: View, event: MotionEvent): Boolean {
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        startX = params.x
+                        startY = params.y
+                        touchX = event.rawX
+                        touchY = event.rawY
+                        moved = false
+                        return true
                     }
-                    true
-                }
 
-                MotionEvent.ACTION_UP -> {
-                    if (!dragged) showPanel()
-                    true
-                }
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = (event.rawX - touchX).toInt()
+                        val dy = (event.rawY - touchY).toInt()
 
-                else -> true
+                        if (kotlin.math.abs(dx) > 8 ||
+                            kotlin.math.abs(dy) > 8
+                        ) {
+                            moved = true
+                        }
+
+                        params.x = (startX + dx).coerceAtLeast(0)
+                        params.y = (startY + dy).coerceAtLeast(0)
+
+                        try {
+                            windowManager.updateViewLayout(view, params)
+                        } catch (_: Exception) {
+                        }
+                        return true
+                    }
+
+                    MotionEvent.ACTION_UP -> {
+                        if (!moved) {
+                            openPanel()
+                        }
+                        return true
+                    }
+                }
+                return true
             }
-        }
+        })
 
-        windowManager.addView(view, params)
+        try {
+            windowManager.addView(view, params)
+            bubble = view
+        } catch (_: Exception) {
+            bubble = null
+        }
+    }
+
+    private fun openPanel() {
+        if (destroyed || expanded) return
+
+        removeBubble()
+        showPanel()
     }
 
     private fun showPanel() {
-        if (expanded) return
+        if (destroyed || expanded) return
+        if (!Settings.canDrawOverlays(this)) return
 
-        bubble?.let {
-            runCatching { windowManager.removeView(it) }
-        }
-        bubble = null
-
-        val root = LinearLayout(this).apply {
+        val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(18, 16, 18, 16)
-            background = makeBackground(dark, 24f)
+            setPadding(14, 12, 14, 12)
+            background = createBackground(
+                Color.rgb(24, 29, 40),
+                22f
+            )
         }
 
-        root.addView(TextView(this).apply {
-            text = "⚡ FLASH"
-            textSize = 22f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(green)
-        })
-
-        root.addView(TextView(this).apply {
-            text = "NET STABILIZER"
-            textSize = 13f
-            setTextColor(Color.WHITE)
-        })
-
-        connectionView = TextView(this).apply {
-            text = "Connection: Not checked"
-            textSize = 14f
-            setTextColor(Color.WHITE)
-            setPadding(0, 12, 0, 4)
-        }
-        root.addView(connectionView)
-
-        latencyView = TextView(this).apply {
-            text = "Internet check: Not started"
-            textSize = 13f
-            setTextColor(Color.LTGRAY)
-            setPadding(0, 4, 0, 10)
-        }
-        root.addView(latencyView)
-
-        statusView = TextView(this).apply {
-            text = "Monitoring is OFF"
-            textSize = 13f
-            setTextColor(green)
-        }
-        root.addView(statusView)
-
-        monitorButton = Button(this).apply {
-            text = "MONITORING: OFF"
-            setOnClickListener {
-                monitoring = !monitoring
-
-                text = if (monitoring) {
-                    "MONITORING: ON"
-                } else {
-                    "MONITORING: OFF"
-                }
-
-                if (monitoring) {
-                    statusView?.text = "Checking connection..."
-                    mainHandler.removeCallbacks(monitorTask)
-                    monitorTask.run()
-                } else {
-                    mainHandler.removeCallbacks(monitorTask)
-                    statusView?.text = "Monitoring stopped"
-                }
+        content.addView(
+            makeText(
+                "FLASH NET STABILIZER",
+                19f
+            ).apply {
+                typeface = Typeface.DEFAULT_BOLD
             }
-        }
-        root.addView(monitorButton)
+        )
 
-        root.addView(Button(this).apply {
-            text = "HIDE TO BUBBLE"
-            setOnClickListener {
+        content.addView(
+            makeText(
+                "Network diagnostics",
+                13f,
+                Color.LTGRAY
+            )
+        )
+
+        connectionText = makeText("Connection: checking...", 14f)
+        latencyText = makeText("Probe time: --", 14f)
+        averageText = makeText("Average probe time: --", 14f)
+        jitterText = makeText("Jitter estimate: --", 14f)
+        failureText = makeText("Failed probes: --", 14f)
+        statusText = makeText("Monitoring is OFF", 13f, Color.YELLOW)
+
+        content.addView(connectionText)
+        content.addView(latencyText)
+        content.addView(averageText)
+        content.addView(jitterText)
+        content.addView(failureText)
+        content.addView(statusText)
+
+        toggleButton = makeButton("START MONITORING") {
+            toggleMonitoring()
+        }
+
+        content.addView(toggleButton)
+
+        content.addView(
+            makeButton("HIDE TO BUBBLE") {
                 hidePanelToBubble()
             }
-        })
+        )
 
-        root.addView(Button(this).apply {
-            text = "CLOSE FLASH"
-            setOnClickListener {
+        content.addView(
+            makeButton("CLOSE FLASH") {
                 stopSelf()
             }
-        })
+        )
 
         val scroll = ScrollView(this).apply {
-            addView(root)
+            addView(content)
+            background = createBackground(
+                Color.rgb(24, 29, 40),
+                22f
+            )
         }
 
-        val params = createParams().apply {
-            width = (resources.displayMetrics.widthPixels * 0.82f).toInt()
-            height = WindowManager.LayoutParams.WRAP_CONTENT
-            gravity = Gravity.CENTER
-            x = 0
-            y = 0
+        val params = layoutParams(
+            (resources.displayMetrics.widthPixels * 0.88f).toInt(),
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            Gravity.CENTER
+        ).apply {
+            flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            width = minOf(width, 360)
         }
 
-        panel = root
-        expanded = true
-        windowManager.addView(scroll, params)
+        try {
+            windowManager.addView(scroll, params)
+            panel = scroll
+            expanded = true
+        } catch (_: Exception) {
+            panel = null
+            expanded = false
+            showBubble()
+        }
+    }
+
+    private fun toggleMonitoring() {
+        if (monitoring) {
+            monitoring = false
+            handler.removeCallbacks(monitorTask)
+            toggleButton?.text = "START MONITORING"
+            statusText?.text = "Monitoring is OFF"
+        } else {
+            monitoring = true
+            toggleButton?.text = "STOP MONITORING"
+            statusText?.text = "Checking network..."
+            handler.removeCallbacks(monitorTask)
+            handler.post(monitorTask)
+        }
+    }
+
+    private fun updatePanel(status: NetworkStatus) {
+        connectionText?.text =
+            "Connection: ${status.transport} | " +
+            if (status.internetValidated) {
+                "Internet OK"
+            } else {
+                "Internet unverified"
+            }
+
+        latencyText?.text =
+            "Latest probe: ${status.latencyMs?.let { "$it ms" } ?: "Failed"}"
+
+        averageText?.text =
+            "Average probe: ${status.averageLatencyMs?.let { "$it ms" } ?: "--"}"
+
+        jitterText?.text =
+            "Jitter estimate: ${status.jitterMs?.let {
+                String.format(java.util.Locale.US, "%.1f ms", it)
+            } ?: "--"}"
+
+        failureText?.text =
+            "Failed probes: ${status.failedProbes}/${status.totalProbes} " +
+            "(${String.format(java.util.Locale.US, "%.1f", status.failurePercent)}%)"
+
+        statusText?.text = status.message
     }
 
     private fun hidePanelToBubble() {
-        // Remove the actual view attached to WindowManager.
-        panel?.let { root ->
-            val parent = root.parent
-            if (parent is View) {
-                runCatching { windowManager.removeView(parent) }
-            } else {
-                runCatching { windowManager.removeView(root) }
+        panel?.let {
+            try {
+                windowManager.removeView(it)
+            } catch (_: Exception) {
             }
         }
 
         panel = null
-        statusView = null
-        connectionView = null
-        latencyView = null
-        monitorButton = null
         expanded = false
+
+        connectionText = null
+        latencyText = null
+        averageText = null
+        jitterText = null
+        failureText = null
+        statusText = null
+        toggleButton = null
 
         showBubble()
     }
 
-    override fun onDestroy() {
-        monitoring = false
-        mainHandler.removeCallbacks(monitorTask)
-        monitor?.close()
-        monitor = null
-
+    private fun removeBubble() {
         bubble?.let {
-            runCatching { windowManager.removeView(it) }
-        }
-
-        panel?.let { root ->
-            val parent = root.parent
-            if (parent is View) {
-                runCatching { windowManager.removeView(parent) }
-            } else {
-                runCatching { windowManager.removeView(root) }
+            try {
+                windowManager.removeView(it)
+            } catch (_: Exception) {
             }
         }
-
         bubble = null
-        panel = null
-        expanded = false
+    }
 
-        stopForeground(STOP_FOREGROUND_REMOVE)
+    override fun onDestroy() {
+        destroyed = true
+        monitoring = false
+        handler.removeCallbacksAndMessages(null)
+
+        monitor.close()
+
+        panel?.let {
+            try {
+                windowManager.removeView(it)
+            } catch (_: Exception) {
+            }
+        }
+        panel = null
+
+        removeBubble()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+
         super.onDestroy()
     }
+
+    override fun onBind(intent: Intent?): IBinder? = null
 }
