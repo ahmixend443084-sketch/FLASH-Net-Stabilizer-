@@ -6,12 +6,16 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
-import android.os.Build
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
 import kotlin.math.abs
-import kotlin.math.sqrt
+
+data class EndpointResult(
+    val name: String,
+    val latencyMs: Long?,
+    val successful: Boolean
+)
 
 data class NetworkStatus(
     val connected: Boolean,
@@ -22,7 +26,10 @@ data class NetworkStatus(
     val jitterMs: Double?,
     val failedProbes: Int,
     val totalProbes: Int,
-    val message: String
+    val message: String,
+    val bestEndpoint: String? = null,
+    val bestEndpointLatencyMs: Long? = null,
+    val endpointResults: List<EndpointResult> = emptyList()
 ) {
     val failurePercent: Double
         get() = if (totalProbes == 0) {
@@ -36,37 +43,43 @@ class NetworkMonitor(context: Context) {
 
     private val appContext = context.applicationContext
 
+    private val manager =
+        appContext.getSystemService(
+            Context.CONNECTIVITY_SERVICE
+        ) as ConnectivityManager
+
     private val executor = Executors.newSingleThreadExecutor()
 
-    private val manager = appContext.getSystemService(
-        Context.CONNECTIVITY_SERVICE
-    ) as ConnectivityManager
+    private val history = ArrayDeque<Long>()
 
-    private val samples = ArrayDeque<Long>()
-    private var totalProbes = 0
     private var failedProbes = 0
+    private var totalProbes = 0
 
     @Volatile
     private var closed = false
 
+    private val endpoints = listOf(
+        "Google" to "https://www.google.com/generate_204",
+        "Google Connectivity" to
+            "https://connectivitycheck.gstatic.com/generate_204",
+        "Cloudflare" to "https://cp.cloudflare.com/generate_204"
+    )
+
     private val networkCallback =
         object : ConnectivityManager.NetworkCallback() {
-
             override fun onAvailable(network: Network) {
-                // A network became available.
-                // The next scheduled probe checks connectivity.
+                // The next periodic check uses the active network.
             }
 
             override fun onLost(network: Network) {
-                // A network was lost.
-                // The next check reports the current connection.
+                // The next periodic check reports connectivity.
             }
 
             override fun onCapabilitiesChanged(
                 network: Network,
                 capabilities: NetworkCapabilities
             ) {
-                // Network capabilities may have changed.
+                // Capabilities are checked during each monitoring cycle.
             }
         }
 
@@ -77,7 +90,7 @@ class NetworkMonitor(context: Context) {
                 networkCallback
             )
         } catch (_: Exception) {
-            // Monitoring still works through periodic checks.
+            // Periodic checks can still work.
         }
     }
 
@@ -88,22 +101,22 @@ class NetworkMonitor(context: Context) {
             if (closed) return@execute
 
             val network = manager.activeNetwork
-            val capabilities = network?.let {
+            val caps = network?.let {
                 manager.getNetworkCapabilities(it)
             }
 
-            val connected = capabilities != null
+            val connected = caps != null
 
             val transport = when {
-                capabilities?.hasTransport(
+                caps?.hasTransport(
                     NetworkCapabilities.TRANSPORT_WIFI
                 ) == true -> "Wi-Fi"
 
-                capabilities?.hasTransport(
+                caps?.hasTransport(
                     NetworkCapabilities.TRANSPORT_CELLULAR
                 ) == true -> "Mobile data"
 
-                capabilities?.hasTransport(
+                caps?.hasTransport(
                     NetworkCapabilities.TRANSPORT_ETHERNET
                 ) == true -> "Ethernet"
 
@@ -112,30 +125,51 @@ class NetworkMonitor(context: Context) {
             }
 
             val validated =
-                capabilities?.hasCapability(
+                caps?.hasCapability(
                     NetworkCapabilities.NET_CAPABILITY_VALIDATED
                 ) == true
 
-            val latency = if (connected && validated) {
-                probeLatency(network)
+            val results = if (network != null && validated) {
+                endpoints.map { (name, address) ->
+                    if (closed) {
+                        EndpointResult(name, null, false)
+                    } else {
+                        val time = measureEndpoint(network, address)
+
+                        EndpointResult(
+                            name = name,
+                            latencyMs = time,
+                            successful = time != null
+                        )
+                    }
+                }
             } else {
-                null
+                emptyList()
             }
 
-            totalProbes++
+            val successful = results.filter {
+                it.successful && it.latencyMs != null
+            }
 
-            if (latency == null) {
-                failedProbes++
-            } else {
-                samples.addLast(latency)
+            val best = successful.minByOrNull {
+                it.latencyMs!!
+            }
 
-                while (samples.size > 12) {
-                    samples.removeFirst()
+            val currentLatency = best?.latencyMs
+
+            totalProbes += results.size
+            failedProbes += results.count { !it.successful }
+
+            if (currentLatency != null) {
+                history.addLast(currentLatency)
+
+                while (history.size > 12) {
+                    history.removeFirst()
                 }
             }
 
-            val average = if (samples.isNotEmpty()) {
-                samples.average().toLong()
+            val average = if (history.isNotEmpty()) {
+                history.average().toLong()
             } else {
                 null
             }
@@ -145,10 +179,10 @@ class NetworkMonitor(context: Context) {
             val message = when {
                 !connected -> "No active network"
                 !validated -> "Internet is not validated"
-                latency == null -> "Probe failed; retrying"
-                latency < 100 -> "Probe response time is low"
-                latency < 200 -> "Probe response time is moderate"
-                else -> "Probe response time is high"
+                successful.isEmpty() -> "All endpoint tests failed"
+                currentLatency!! < 100 -> "Best test response is low"
+                currentLatency < 200 -> "Best test response is moderate"
+                else -> "Best test response is high"
             }
 
             if (!closed) {
@@ -157,40 +191,45 @@ class NetworkMonitor(context: Context) {
                         connected = connected,
                         transport = transport,
                         internetValidated = validated,
-                        latencyMs = latency,
+                        latencyMs = currentLatency,
                         averageLatencyMs = average,
                         jitterMs = jitter,
                         failedProbes = failedProbes,
                         totalProbes = totalProbes,
-                        message = message
+                        message = message,
+                        bestEndpoint = best?.name,
+                        bestEndpointLatencyMs = best?.latencyMs,
+                        endpointResults = results
                     )
                 )
             }
         }
     }
 
-    private fun probeLatency(network: Network): Long? {
+    private fun measureEndpoint(
+        network: Network,
+        address: String
+    ): Long? {
         var connection: HttpURLConnection? = null
 
         return try {
-            val url = URL("https://connectivitycheck.gstatic.com/generate_204")
-
-            connection = (network.openConnection(url)
+            connection = (network.openConnection(URL(address))
                 as HttpURLConnection).apply {
                 requestMethod = "GET"
-                connectTimeout = 2500
-                readTimeout = 2500
+                connectTimeout = 1200
+                readTimeout = 1200
                 instanceFollowRedirects = false
                 useCaches = false
             }
 
             val start = System.nanoTime()
             connection.connect()
-            val code = connection.responseCode
+
+            val responseCode = connection.responseCode
             val elapsed =
                 (System.nanoTime() - start) / 1_000_000
 
-            if (code == 204) elapsed else null
+            if (responseCode == 204) elapsed else null
         } catch (_: Exception) {
             null
         } finally {
@@ -199,18 +238,13 @@ class NetworkMonitor(context: Context) {
     }
 
     private fun calculateJitter(): Double? {
-        if (samples.size < 2) return null
+        if (history.size < 2) return null
 
-        val values = samples.toList()
-        val differences = values.zipWithNext { a, b ->
-            abs(b - a).toDouble()
-        }
+        val values = history.toList()
 
-        return if (differences.isEmpty()) {
-            null
-        } else {
-            differences.average()
-        }
+        return values.zipWithNext { first, second ->
+            abs(second - first).toDouble()
+        }.average()
     }
 
     fun close() {
@@ -219,7 +253,6 @@ class NetworkMonitor(context: Context) {
         try {
             manager.unregisterNetworkCallback(networkCallback)
         } catch (_: Exception) {
-            // Callback may not have been registered.
         }
 
         executor.shutdownNow()
